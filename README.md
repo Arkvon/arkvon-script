@@ -10,10 +10,10 @@
 
 ## Track Events
 
-`<script>
-// Wait for script to load
-document.addEventListener('arkvonScriptLoaded', function() {
-
+```
+<script>
+    // Wait for script to load
+    document.addEventListener('arkvonScriptLoaded', function() {
         // Track signup
         arkvon('signup', {
           email: 'user@example.com',
@@ -49,7 +49,8 @@ document.addEventListener('arkvonScriptLoaded', function() {
           console.log(arkvonUtils.getReferralData());
         }
       });
-    </script>`
+    </script>
+```
 
 ### SUPPORTED PAYMENT PROCESSORS:
 
