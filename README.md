@@ -2,24 +2,17 @@
 
 ## Basic Setup
 
-    `<script data-arkvon="your_public_id" src="arkvon-tracking.js"></script>`
+`<script data-arkvon="your_public_id" src="arkvon-tracking.js"></script>`
 
 ## With Payment Integration
 
-```<script
-      data-arkvon="your_public_id"
-      data-payment-type="stripe_links"
-      data-payment-domain="https://buy.stripe.com"
-      src="arkvon-tracking.js">
-</script>
-```
+`<script data-arkvon="your_public_id" data-payment-type="stripe_links" data-payment-domain="https://buy.stripe.com" src="arkvon-tracking.js"></script>`
 
 ## Track Events
 
-```
-    <script>
-      // Wait for script to load
-      document.addEventListener('arkvonScriptLoaded', function() {
+`<script>
+// Wait for script to load
+document.addEventListener('arkvonScriptLoaded', function() {
 
         // Track signup
         arkvon('signup', {
@@ -56,8 +49,7 @@
           console.log(arkvonUtils.getReferralData());
         }
       });
-    </script>
-```
+    </script>`
 
 ### SUPPORTED PAYMENT PROCESSORS:
 
