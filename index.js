@@ -1,583 +1,446 @@
+/**
+ * Arkvon Tracking Script v2.0
+ *
+ * Install on any merchant website:
+ *   <script data-arkvon="your-campaign-slug" src="https://cdn.arkvon.com/track.js" async></script>
+ *
+ * Optional: enable verbose debug logging during development:
+ *   <script>window.ARKVON_DEBUG = true;</script>  (add BEFORE the script tag)
+ */
 (() => {
-  // Configuration
-  let apiBaseUrl = "https://api.arkvon.com/"; // will be updated when the backend is hosted
-  let publicId = null;
-  let domain = null;
+  // ---------------------------------------------------------------------------
+  // Internal helpers
+  // ---------------------------------------------------------------------------
 
-  // Queue system for commands before script is fully loaded
-  function queueCommand(command, data) {
-    commandQueue.push({ command: command, data: data });
+  const API_BASE = "https://api.arkvon.com"; // no trailing slash
+  const COOKIE_DURATION_DAYS = 30;
+
+  // ---------------------------------------------------------------------------
+  // Cookie-domain hardcoded multi-part public suffix list
+  // ---------------------------------------------------------------------------
+  // Browsers reject `Domain=co.uk` and similar because public suffixes can't
+  // own cookies — but our previous "always slice last 2 parts" logic produced
+  // exactly that. Result: silent attribution failure for every merchant on
+  // .co.uk, .com.au, .co.nz, etc. (cookies were never set, but the script
+  // logged success). We don't want to bundle the full Public Suffix List
+  // (40k+ entries, ~4MB JSON) for an MVP script — instead we cover the
+  // commercial registrable suffixes our target market actually uses. Hosts
+  // not in this list fall back to the standard "last 2 parts" assumption,
+  // which is correct for ~95% of real merchants (.com, .net, .org, .io, .app,
+  // .dev, .co, .ai, plus all the new gTLDs).
+  //
+  // If a merchant on an unlisted multi-part TLD reports broken
+  // cross-subdomain attribution, add their suffix here. Updating the list
+  // is cheaper than maintaining a PSL build pipeline.
+  const KNOWN_MULTI_PART_TLDS = [
+    ".co.uk", ".org.uk", ".ac.uk", ".gov.uk", ".me.uk", ".net.uk", ".ltd.uk", ".plc.uk",
+    ".com.au", ".net.au", ".org.au", ".edu.au", ".gov.au", ".id.au",
+    ".co.nz", ".net.nz", ".org.nz",
+    ".com.br", ".net.br", ".org.br",
+    ".co.jp", ".or.jp", ".ne.jp",
+    ".com.cn", ".com.hk", ".com.tw", ".com.sg", ".com.tr",
+    ".com.mx", ".com.ar",
+    ".co.in", ".co.za", ".co.kr", ".co.il", ".co.id", ".co.th",
+  ];
+
+  let campaignSlug = null; // value of data-arkvon attribute
+  let cookieDomain = null;
+  let queuedCommands = [];
+
+  // Support calls made before the script fully initializes.
+  if (!window.arkvon) {
+    const stub = (command, data) => {
+      queuedCommands.push({ command, data });
+    };
+    stub.queue = queuedCommands;
+    window.arkvon = stub;
+  } else if (Array.isArray(window.arkvon.queue)) {
+    queuedCommands = window.arkvon.queue;
+  } else {
+    window.arkvon.queue = queuedCommands;
   }
 
-  var commandQueue;
+  function log(...args) {
+    if (window.ARKVON_DEBUG) console.log("[Arkvon]", ...args);
+  }
+  function warn(...args) {
+    console.warn("[Arkvon]", ...args);
+  }
 
-  // Initialize global Arkvon variables
-  window.arkvon_referral = null;
-  window.arkvon_data = null;
-  window.arkvon =
-    window.arkvon ||
-    ((commandQueue = []), (queueCommand.queue = commandQueue), queueCommand);
+  // ---------------------------------------------------------------------------
+  // Cookie domain resolver — public-suffix aware fallback
+  // ---------------------------------------------------------------------------
+  // Returns either:
+  //   - a leading-dot domain string (".merchant.com" or ".merchant.co.uk")
+  //     for cross-subdomain cookie scoping, OR
+  //   - null, meaning "set the cookie with NO Domain attribute" so it's
+  //     scoped to the exact host. We pick null for: localhost, *.local,
+  //     IP literals, single-label hosts, hosts that look like bare public
+  //     suffixes, and anything we can't confidently slice. Better to lose
+  //     cross-subdomain support than silently fail to set the cookie at all.
+  function computeCookieDomain(rawHost) {
+    if (!rawHost) return null;
+    const host = rawHost.toLowerCase();
 
-  // Enhanced cookie management with better security and flexibility
-  function setArkvonCookie(name, value, days, options = {}) {
+    if (host === "localhost" || host.endsWith(".local")) return null;
+
+    // IPv4 literal (e.g. 127.0.0.1) — cookies can't take a Domain attr on
+    // raw IPs; let the browser scope to the exact host.
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return null;
+    // IPv6 literal — `[::1]` style or bare colons, never set Domain.
+    if (host.includes(":") || host.startsWith("[")) return null;
+
+    const parts = host.split(".");
+    if (parts.length < 2) return null; // single-label, treat as host-only
+
+    // Multi-part public suffix (e.g. .co.uk) — registrable domain is last 3.
+    for (let i = 0; i < KNOWN_MULTI_PART_TLDS.length; i++) {
+      if (host.endsWith(KNOWN_MULTI_PART_TLDS[i])) {
+        if (parts.length < 3) return null; // bare ".co.uk" host — give up
+        return "." + parts.slice(-3).join(".");
+      }
+    }
+
+    // Single-part TLD (.com, .io, .app, etc.) — registrable domain is last 2.
+    return "." + parts.slice(-2).join(".");
+  }
+
+  // ---------------------------------------------------------------------------
+  // AbortSignal.timeout polyfill
+  // ---------------------------------------------------------------------------
+  // `AbortSignal.timeout()` is a 2022 addition (Chrome 103+, Safari 16+,
+  // Firefox 100+). Older Safari iOS (15 and earlier) and the long tail of
+  // older browsers throw `TypeError: AbortSignal.timeout is not a function`
+  // synchronously when fetch reads `options.signal`. The fetch-level
+  // try/catch DOES catch it, but every retry fails identically because the
+  // function never appears, so signups are silently dropped on those
+  // browsers. The fallback below uses the universally-supported
+  // AbortController + setTimeout pair to produce an equivalent signal.
+  function timeoutSignal(ms) {
+    if (
+      typeof AbortSignal !== "undefined" &&
+      typeof AbortSignal.timeout === "function"
+    ) {
+      return AbortSignal.timeout(ms);
+    }
+    if (typeof AbortController === "undefined") return undefined;
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), ms);
+    return ctrl.signal;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cookie helpers
+  // ---------------------------------------------------------------------------
+
+  function setCookie(name, value, days) {
     try {
-      if (!name || value === undefined || value === null) {
-        console.warn(`[Arkvon] Invalid cookie parameters: ${name}, ${value}`);
-        return false;
-      }
-
-      let date = new Date();
-      date.setTime(date.getTime() + days * 24 * 60 * 60 * 1000);
-      let expires = "expires=" + date.toUTCString();
-
-      // Default cookie options
-      let cookieOptions = {
-        path: "/",
-        domain: domain,
-        samesite: "lax",
-        secure: window.location.protocol === "https:",
-        ...options,
-      };
-
-      let cookieString;
-      if (name === "arkvon_referral") {
-        // Simple string value for referral code
-        cookieString = `arkvon_referral=${encodeURIComponent(value)}`;
-      } else {
-        // JSON encoded value for complex data
-        cookieString = `${name}=${encodeURIComponent(JSON.stringify(value))}`;
-      }
-
-      // Add options to cookie string
-      cookieString += `;${expires};path=${cookieOptions.path}`;
-      if (cookieOptions.domain)
-        cookieString += `;domain=${cookieOptions.domain}`;
-      cookieString += `;samesite=${cookieOptions.samesite}`;
-      if (cookieOptions.secure) cookieString += `;secure`;
-
-      document.cookie = cookieString;
-      console.log(`[Arkvon] Set cookie: ${name}`);
-      return true;
-    } catch (error) {
-      console.error(`[Arkvon] Failed to set cookie ${name}:`, error);
-      return false;
+      const expires = new Date(Date.now() + days * 864e5).toUTCString();
+      const serialised =
+        typeof value === "string" ? value : JSON.stringify(value);
+      let str = `${name}=${encodeURIComponent(serialised)};expires=${expires};path=/;samesite=lax`;
+      if (cookieDomain) str += `;domain=${cookieDomain}`;
+      if (window.location.protocol === "https:") str += ";secure";
+      document.cookie = str;
+    } catch (e) {
+      warn("setCookie failed:", e);
     }
   }
 
-  function getArkvonCookie(name) {
+  function getCookie(name) {
     try {
-      if (!name) {
-        console.warn("[Arkvon] Cookie name is required");
-        return null;
-      }
-
-      let cookieArray = ("; " + document.cookie).split(`; ${name}=`);
-
-      if (cookieArray.length === 2) {
-        let cookieValue = decodeURIComponent(
-          cookieArray.pop().split(";").shift()
-        );
-
-        if (!cookieValue) return null;
-
-        try {
-          return JSON.parse(cookieValue);
-        } catch (error) {
-          return cookieValue;
-        }
-      }
-      return null;
-    } catch (error) {
-      console.error(`[Arkvon] Failed to get cookie ${name}:`, error);
-      return null;
-    }
-  }
-
-  // Enhanced API communication with retry logic and better error handling
-  async function makeArkvonApiCall(endpoint, data, retries = 3) {
-    if (!publicId) {
-      console.warn("[Arkvon] Public ID missing. API calls disabled.");
-      return null;
-    }
-
-    if (!endpoint || typeof endpoint !== "string") {
-      console.warn("[Arkvon] Invalid endpoint provided");
-      return null;
-    }
-
-    for (let attempt = 1; attempt <= retries; attempt++) {
+      const match = ("; " + document.cookie).split(`; ${name}=`);
+      if (match.length < 2) return null;
+      const raw = decodeURIComponent(match.pop().split(";")[0]);
+      if (!raw) return null;
       try {
-        console.log(`[Arkvon] API call to ${endpoint} (attempt ${attempt})`);
+        return JSON.parse(raw);
+      } catch {
+        return raw;
+      }
+    } catch (e) {
+      return null;
+    }
+  }
 
-        let requestData = {
-          ...data,
-          public_id: publicId,
-          domain: domain || window.location.hostname,
-          timestamp: Date.now(),
-          user_agent: navigator.userAgent,
-          referrer: document.referrer || null,
-          page_url: window.location.href,
-        };
+  function deleteCookie(name) {
+    const domainStr = cookieDomain ? `;domain=${cookieDomain}` : "";
+    document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/${domainStr}`;
+  }
 
-        if (window.arkvon_referral) {
-          requestData.referral_code = window.arkvon_referral;
-        }
+  // ---------------------------------------------------------------------------
+  // Attribution data stored in cookies
+  // ---------------------------------------------------------------------------
 
-        let response = await fetch(`${apiBaseUrl}/${endpoint}`, {
+  /**
+   * Returns whatever referral state is currently stored.
+   * Shape: { referralCode, clickId, landingPage, referrerUrl, createdAt }
+   */
+  function getStoredAttribution() {
+    const code = getCookie("arkvon_referral");
+    const data = getCookie("arkvon_data");
+    if (!code) return null;
+    return { referralCode: code, ...(data && typeof data === "object" ? data : {}) };
+  }
+
+  function storeAttribution(referralCode, clickId, trk) {
+    setCookie("arkvon_referral", referralCode, COOKIE_DURATION_DAYS);
+    const dataObj = {
+      clickId: clickId || null,
+      trk: trk || null,
+      landingPage: window.location.href,
+      referrerUrl: document.referrer || null,
+      createdAt: Date.now(),
+    };
+    setCookie("arkvon_data", dataObj, COOKIE_DURATION_DAYS);
+    window.arkvon_referral = referralCode;
+    window.arkvon_data = { referralCode, ...dataObj };
+  }
+
+  // ---------------------------------------------------------------------------
+  // URL param extraction
+  // ---------------------------------------------------------------------------
+
+  function extractAttributionFromUrl() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const referralCode = params.get("ref") || params.get("arkvon") || params.get("aff");
+      const clickId = params.get("click_id") || null;
+      const trk = params.get("trk") || null;
+      return referralCode ? { referralCode: referralCode.trim(), clickId, trk } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // API communication
+  // ---------------------------------------------------------------------------
+
+  async function apiPost(path, payload, retries = 2) {
+    const url = `${API_BASE}/${path}`;
+    for (let attempt = 1; attempt <= retries + 1; attempt++) {
+      try {
+        const body = new URLSearchParams();
+        Object.entries(payload).forEach(([key, value]) => {
+          if (value === null || value === undefined) return;
+          body.append(key, String(value));
+        });
+
+        const res = await fetch(url, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Arkvon-Version": "1.0",
-            "X-Arkvon-Source": "tracking-script",
-          },
-          body: JSON.stringify(requestData),
-          signal: AbortSignal.timeout(10000), // 10 second timeout
+          mode: "no-cors",
+          keepalive: true,
+          body,
+          signal: timeoutSignal(8000),
         });
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        let result = await response.json();
-        console.log(`[Arkvon] API call successful:`, result);
-
-        // Handle specific responses with better error checking
-        if (endpoint === "signup" && result && result.customer_id) {
-          if (window.arkvon_data) {
-            window.arkvon_data.customer_id = result.customer_id;
-            setArkvonCookie("arkvon_data", window.arkvon_data, 30);
-          }
-        }
-
-        return result;
-      } catch (error) {
-        console.error(`[Arkvon] API call failed (attempt ${attempt}):`, error);
-
-        if (attempt === retries) {
-          console.error(`[Arkvon] All API attempts failed for ${endpoint}`);
-          return null;
-        }
-
-        // Wait before retry (exponential backoff with jitter)
-        const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
-    }
-  }
-
-  // Enhanced command processor with better validation
-  async function processArkvonCommand(command, data = {}) {
-    if (!command || typeof command !== "string") {
-      console.warn("[Arkvon] Invalid command provided");
-      return null;
-    }
-
-    console.log(`[Arkvon] Processing command: ${command}`, data);
-
-    try {
-      switch (command) {
-        case "signup":
-          if (!data.email) {
-            console.warn("[Arkvon] Email is required for signup tracking");
-            return null;
-          }
-          return await makeArkvonApiCall("signup", {
-            email: data.email,
-            name: data.name || null,
-            signup_source: data.source || "website",
-            ...data,
-          });
-
-        case "custom":
-          if (!data.event_name) {
-            console.warn("[Arkvon] Event name is required for custom tracking");
-            return null;
-          }
-          return await makeArkvonApiCall("custom_event", {
-            event_name: data.event_name,
-            event_data: data.event_data || {},
-            ...data,
-          });
-
-        default:
-          console.warn(`[Arkvon] Unknown command: ${command}`);
-          return null;
-      }
-    } catch (error) {
-      console.error(`[Arkvon] Error processing command ${command}:`, error);
-      return null;
-    }
-  }
-
-  // Form tracking setup for submit-btn elements
-  function setupFormTracking() {
-    try {
-      console.log("[Arkvon] Setting up form tracking for submit-btn elements");
-
-      // Function to extract form data
-      function extractFormData(form) {
-        const formData = {};
-        const formElements = form.elements;
-
-        for (let element of formElements) {
-          if (element.name && element.value !== undefined) {
-            // Handle different input types
-            switch (element.type) {
-              case "checkbox":
-                formData[element.name] = element.checked;
-                break;
-              case "radio":
-                if (element.checked) {
-                  formData[element.name] = element.value;
-                }
-                break;
-              case "select-multiple":
-                formData[element.name] = Array.from(
-                  element.selectedOptions
-                ).map((option) => option.value);
-                break;
-              default:
-                formData[element.name] = element.value;
-            }
-          }
-        }
-
-        return formData;
-      }
-
-      // Function to handle form submission
-      function handleFormSubmission(event) {
-        try {
-          const form = event.target;
-          const submitBtn = form.querySelector("#submit-btn");
-
-          if (!submitBtn) return; // Only track forms with submit-btn id
-
-          console.log(
-            "[Arkvon] Form with submit-btn detected, extracting data"
+        // no-cors returns opaque responses by design.
+        return { queued: true };
+      } catch (e) {
+        log(`POST ${path} attempt ${attempt} failed:`, e.message);
+        if (attempt <= retries) {
+          await new Promise((r) =>
+            setTimeout(r, Math.pow(2, attempt) * 500 + Math.random() * 300)
           );
-
-          // Extract form data
-          const formData = extractFormData(form);
-
-          // Look for email field (common field names)
-          const emailFields = [
-            "email",
-            "user_email",
-            "customer_email",
-            "signup_email",
-            "login_email",
-          ];
-          let email = null;
-
-          for (let fieldName of emailFields) {
-            if (
-              formData[fieldName] &&
-              typeof formData[fieldName] === "string"
-            ) {
-              email = formData[fieldName].trim();
-              break;
-            }
-          }
-
-          if (!email) {
-            console.warn(
-              "[Arkvon] No email field found in form, cannot track signup"
-            );
-            return;
-          }
-
-          // Prepare signup data
-          const signupData = {
-            email: email,
-            form_data: formData,
-            form_id: form.id || null,
-            form_action: form.action || null,
-            form_method: form.method || "GET",
-            submit_btn_id: submitBtn.id,
-            submit_btn_text:
-              submitBtn.textContent?.trim() || submitBtn.value || null,
-            source: "form_tracking",
-          };
-
-          // Track the signup
-          processArkvonCommand("signup", signupData);
-        } catch (error) {
-          console.error("[Arkvon] Error handling form submission:", error);
         }
       }
+    }
+    warn(`All attempts failed for POST ${path}`);
+    return null;
+  }
 
-      // Set up event listener for form submissions
-      document.addEventListener("submit", handleFormSubmission, true);
+  // ---------------------------------------------------------------------------
+  // Signup / lead tracking
+  // ---------------------------------------------------------------------------
 
-      // Also set up for dynamically added forms
-      const observer = new MutationObserver(function (mutations) {
-        mutations.forEach(function (mutation) {
-          mutation.addedNodes.forEach(function (node) {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              // Check if the added node contains forms with submit-btn
-              const forms =
-                node.tagName === "FORM"
-                  ? [node]
-                  : node.querySelectorAll
-                  ? node.querySelectorAll("form")
-                  : [];
+  async function trackSignup(email, opts = {}) {
+    if (!email || typeof email !== "string") {
+      warn("trackSignup: email is required");
+      return null;
+    }
 
-              forms.forEach(function (form) {
-                if (form.querySelector("#submit-btn")) {
-                  console.log("[Arkvon] New form with submit-btn detected");
-                }
-              });
-            }
-          });
-        });
-      });
+    const attribution = getStoredAttribution();
+    if (!attribution) {
+      log("trackSignup: no referral attribution found, skipping");
+      return null;
+    }
 
-      // Start observing
-      observer.observe(document.body, {
-        childList: true,
-        subtree: true,
-      });
+    const payload = {
+      email: email.trim().toLowerCase(),
+      firstName: opts.firstName || opts.first_name || null,
+      lastName: opts.lastName || opts.last_name || null,
+      referralCode: attribution.referralCode,
+      campaignSlug,
+      clickId: attribution.clickId || null,
+      trk: attribution.trk || null,
+    };
 
-      console.log("[Arkvon] Form tracking setup complete");
-    } catch (error) {
-      console.error("[Arkvon] Error setting up form tracking:", error);
+    log("Sending signup event:", payload);
+    return apiPost("track/signup", payload);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Automatic form tracking
+  // ---------------------------------------------------------------------------
+
+  function findEmailInForm(form) {
+    const emailFields = ["email", "user_email", "customer_email", "signup_email"];
+    const elements = form.elements;
+    for (const field of emailFields) {
+      if (elements[field] && elements[field].value) {
+        return elements[field].value.trim();
+      }
+    }
+    // fallback: first input[type=email]
+    const emailInput = form.querySelector('input[type="email"]');
+    return emailInput ? emailInput.value.trim() : null;
+  }
+
+  // Decide whether a submitted form should be auto-tracked. Three opt-ins:
+  //   1. `<form data-arkvon-track-form>` — explicit, framework-friendly,
+  //      survives Tailwind / shadcn refactors. Recommended for new merchants.
+  //   2. `<button data-arkvon-submit>` (or any descendant) — same intent,
+  //      attached to the CTA element instead of the form itself.
+  //   3. `<button id="submit-btn">` — legacy selector, kept for backward
+  //      compatibility with existing integrations. ID-based selectors are
+  //      brittle (collisions across the page, fights with framework-generated
+  //      IDs), so new merchants should prefer the data-attributes above.
+  //
+  // We deliberately keep #submit-btn working forever — yanking it would
+  // silently break installs that have been collecting data for months.
+  function shouldTrackForm(form) {
+    if (form.hasAttribute("data-arkvon-track-form")) return true;
+    if (form.querySelector("[data-arkvon-submit]")) return true;
+    if (form.querySelector("#submit-btn")) return true;
+    return false;
+  }
+
+  function onFormSubmit(e) {
+    const form = e.target;
+    if (!form || form.tagName !== "FORM") return;
+    if (!shouldTrackForm(form)) return;
+
+    const email = findEmailInForm(form);
+    if (!email) {
+      log("Tracked form submitted but no email field found");
+      return;
+    }
+
+    const firstNameEl = form.elements["first_name"] || form.elements["firstName"];
+    const lastNameEl = form.elements["last_name"] || form.elements["lastName"];
+
+    trackSignup(email, {
+      firstName: firstNameEl ? firstNameEl.value : null,
+      lastName: lastNameEl ? lastNameEl.value : null,
+    });
+  }
+
+  function setupFormTracking() {
+    document.addEventListener("submit", onFormSubmit, true);
+    log(
+      "Form tracking ready (opt-ins: data-arkvon-track-form, [data-arkvon-submit], #submit-btn)"
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Command processor  (window.arkvon("signup", { email }) API)
+  // ---------------------------------------------------------------------------
+
+  async function processCommand(command, data = {}) {
+    switch (command) {
+      case "signup":
+        return trackSignup(data.email, data);
+      case "custom":
+      case "conversion":
+      case "track":
+        // Keep old API surface for backward compatibility while those
+        // endpoints are not enabled server-side.
+        log(`Ignoring unsupported command "${command}" for compatibility.`);
+        return { recorded: false, reason: "unsupported_command" };
+      default:
+        warn(`Unknown command: ${command}`);
+        return null;
     }
   }
 
-  // Main initialization function with better error handling
+  // ---------------------------------------------------------------------------
+  // Initialisation
+  // ---------------------------------------------------------------------------
+
   (async () => {
     try {
-      console.log("[Arkvon] Initializing tracking script...");
+      // 1. Read campaign slug from script tag
+      const scriptEl = document.querySelector("script[data-arkvon]");
+      campaignSlug = scriptEl ? scriptEl.getAttribute("data-arkvon").trim() : null;
 
-      // Find script tag with data-arkvon attribute
-      let scriptTag = document.querySelector("script[data-arkvon]");
-      publicId = scriptTag ? scriptTag.getAttribute("data-arkvon") : null;
-
-      if (!publicId || typeof publicId !== "string" || publicId.trim() === "") {
-        console.warn(
-          "[Arkvon] Valid public ID (data-arkvon) missing. Initialization aborted."
-        );
+      if (!campaignSlug) {
+        warn("data-arkvon attribute missing on script tag — aborting.");
         return;
       }
 
-      publicId = publicId.trim();
-      console.log(`[Arkvon] Public ID: ${publicId}`);
+      log(`Initialising for campaign: ${campaignSlug}`);
 
-      // Main initialization function
-      let initializeArkvon = async () => {
-        // Determine domain for cookie setting with better validation
-        try {
-          let hostname = window.location.hostname;
+      // 2. Determine root domain for cross-subdomain cookies (public-suffix
+      //    aware — see computeCookieDomain comment for rationale).
+      try {
+        cookieDomain = computeCookieDomain(window.location.hostname);
+      } catch {
+        cookieDomain = null;
+      }
 
-          if (!hostname) {
-            console.warn("[Arkvon] Could not determine hostname");
-            domain = null;
-          } else if (hostname === "localhost" || hostname.endsWith(".local")) {
-            domain = hostname;
-          } else {
-            // Extract main domain (e.g., example.com from sub.example.com)
-            let domainParts = hostname.split(".");
-            domain =
-              domainParts.length > 2
-                ? domainParts.slice(-2).join(".")
-                : hostname;
-          }
-
-          console.log(`[Arkvon] Domain: ${domain}`);
-        } catch (error) {
-          console.error("[Arkvon] Error determining domain:", error);
-          domain = null;
+      // 3. Check URL for fresh attribution params (highest priority)
+      const fromUrl = extractAttributionFromUrl();
+      if (fromUrl) {
+        storeAttribution(fromUrl.referralCode, fromUrl.clickId, fromUrl.trk);
+        log("Attribution stored from URL:", fromUrl);
+      } else {
+        // 4. Fall back to cookie
+        const stored = getStoredAttribution();
+        if (stored) {
+          window.arkvon_referral = stored.referralCode;
+          window.arkvon_data = stored;
+          log("Attribution loaded from cookie:", stored.referralCode);
         }
+      }
 
-        // Check for existing tracking data in cookies
-        let existingReferral = getArkvonCookie("arkvon_referral");
-        let existingData = getArkvonCookie("arkvon_data");
-
-        if (existingReferral && typeof existingReferral === "string") {
-          console.log("[Arkvon] Loading existing tracking data from cookies");
-          window.arkvon_referral = existingReferral;
-          window.arkvon_data =
-            existingData && typeof existingData === "object"
-              ? existingData
-              : null;
-        } else {
-          // Look for referral parameters in current URL
-          try {
-            let urlParams = new URLSearchParams(window.location.search);
-
-            // Extended list of referral parameters to check
-            let referralParams = [
-              "arkvon",
-              "ref",
-              "referral",
-              "aff",
-              "affiliate",
-              "partner",
-              "via",
-              "utm_source",
-              "source",
-              "lmref",
-              "fpr",
-              "tap_s",
-              "afmc",
-              "promo",
-            ];
-
-            let foundReferralParam = null;
-            let referralCode = null;
-
-            // Find the first matching referral parameter
-            for (let param of referralParams) {
-              if (urlParams.has(param)) {
-                let paramValue = urlParams.get(param);
-                if (paramValue && paramValue.trim() !== "") {
-                  foundReferralParam = param;
-                  referralCode = paramValue.trim();
-                  console.log(
-                    `[Arkvon] Found referral parameter: ${param}=${referralCode}`
-                  );
-                  break;
-                }
-              }
-            }
-
-            // If referral found, set up tracking
-            if (foundReferralParam && referralCode) {
-              try {
-                console.log(
-                  `[Arkvon] Setting up referral tracking for: ${referralCode}`
-                );
-
-                // Default cookie duration
-                let cookieDuration = 30;
-
-                // Set referral tracking cookie
-                setArkvonCookie(
-                  "arkvon_referral",
-                  referralCode,
-                  cookieDuration
-                );
-                window.arkvon_referral = referralCode;
-
-                // Set comprehensive tracking data
-                window.arkvon_data = {
-                  referral_id: referralCode,
-                  param_name: foundReferralParam,
-                  landing_page: window.location.href,
-                  referrer_url: document.referrer || null,
-                  cookie_duration: cookieDuration,
-                  created_at: Date.now(),
-                };
-
-                setArkvonCookie(
-                  "arkvon_data",
-                  window.arkvon_data,
-                  cookieDuration
-                );
-
-                console.log(
-                  "[Arkvon] Referral tracking activated:",
-                  window.arkvon_data
-                );
-              } catch (error) {
-                console.error(
-                  "[Arkvon] Failed to initialize referral tracking:",
-                  error
-                );
-              }
-            }
-          } catch (error) {
-            console.error("[Arkvon] Error parsing URL parameters:", error);
+      // 5. Drain any commands queued before script loaded
+      if (window.arkvon && Array.isArray(window.arkvon.queue)) {
+        for (const item of window.arkvon.queue) {
+          if (item && item.command) {
+            await processCommand(item.command, item.data || {});
           }
         }
+      }
 
-        // Process any queued commands from before initialization
-        const queueLength = window.arkvon.queue?.length || 0;
-        console.log(`[Arkvon] Processing ${queueLength} queued commands`);
+      // 6. Replace stub with live function
+      window.arkvon = async (command, data = {}) => processCommand(command, data);
+      window.arkvon.signup = (email, opts = {}) => trackSignup(email, opts);
+      window.arkvon.track = (eventName, eventData = {}) =>
+        processCommand("track", { event_name: eventName, event_data: eventData });
+      window.arkvon.conversion = (value, type = "purchase") =>
+        processCommand("conversion", { value, type });
 
-        if (window.arkvon.queue && Array.isArray(window.arkvon.queue)) {
-          for (let item of window.arkvon.queue) {
-            if (item && typeof item === "object" && item.command) {
-              try {
-                await processArkvonCommand(item.command, item.data || {});
-              } catch (error) {
-                console.error(
-                  "[Arkvon] Error processing queued command:",
-                  error
-                );
-              }
-            }
-          }
-        }
-
-        // Clear queue and replace with direct function
-        window.arkvon.queue = [];
-        window.arkvon = async function (command, data = {}) {
-          return await processArkvonCommand(command, data);
-        };
-
-        // Add convenience methods with better validation
-        window.arkvon.signup = async function (email, additionalData = {}) {
-          if (!email || typeof email !== "string") {
-            console.warn("[Arkvon] Valid email is required for signup");
-            return null;
-          }
-          return await processArkvonCommand("signup", {
-            email,
-            ...additionalData,
-          });
-        };
-
-        // Set up form tracking for submit-btn elements
-        setupFormTracking();
-
-        // Dispatch ready event
-        document.dispatchEvent(new Event("arkvonScriptLoaded"));
-        console.log("[Arkvon] Tracking script fully initialized and ready");
+      // 7. Expose utility helpers
+      window.arkvonUtils = {
+        getReferralData: () => getStoredAttribution(),
+        isReferralUser: () => !!getStoredAttribution(),
+        clearTracking: () => {
+          deleteCookie("arkvon_referral");
+          deleteCookie("arkvon_data");
+          window.arkvon_referral = null;
+          window.arkvon_data = null;
+          log("Tracking cleared");
+        },
       };
 
-      // Initialize immediately (no external dependencies required)
-      await initializeArkvon();
-    } catch (error) {
-      console.error("[Arkvon] Critical initialization error:", error);
+      // 8. Auto form tracking
+      setupFormTracking();
+
+      document.dispatchEvent(new CustomEvent("arkvonReady", { detail: { campaignSlug } }));
+      document.dispatchEvent(new Event("arkvonScriptLoaded"));
+      log("Ready.");
+    } catch (e) {
+      warn("Initialisation error:", e);
     }
   })();
-
-  // Expose utility functions for manual integration
-  window.arkvonUtils = {
-    // Get current referral data
-    getReferralData: () => ({
-      referral_code: window.arkvon_referral,
-      tracking_data: window.arkvon_data,
-    }),
-
-    // Check if user came from referral
-    isReferralUser: () => !!window.arkvon_referral,
-
-    // Manually set referral (useful for custom integrations)
-    setReferral: (referralCode, duration = 30) => {
-      window.arkvon_referral = referralCode;
-      setArkvonCookie("arkvon_referral", referralCode, duration);
-      console.log(`[Arkvon] Manually set referral: ${referralCode}`);
-    },
-
-    // Clear all tracking data
-    clearTracking: () => {
-      try {
-        const expireDate = "expires=Thu, 01 Jan 1970 00:00:00 UTC";
-        const cookiePath = "path=/";
-        const domainStr = domain ? `;domain=${domain}` : "";
-
-        document.cookie = `arkvon_referral=; ${expireDate}; ${cookiePath}${domainStr}`;
-        document.cookie = `arkvon_data=; ${expireDate}; ${cookiePath}${domainStr}`;
-
-        window.arkvon_referral = null;
-        window.arkvon_data = null;
-        console.log("[Arkvon] Tracking data cleared");
-      } catch (error) {
-        console.error("[Arkvon] Error clearing tracking data:", error);
-      }
-    },
-  };
 })();
