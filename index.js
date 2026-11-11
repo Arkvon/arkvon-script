@@ -389,18 +389,20 @@
       }
 
       // 3. Check URL for fresh attribution params (highest priority)
+      //    A link carrying Arkvon's signed token (trk) comes from an affiliate
+      //    link click, so it replaces what's stored. A bare ?ref= is often a
+      //    marketing tag (?ref=producthunt), so it only counts when nothing
+      //    is stored yet; replacing a real referral with it lost the sale.
       const fromUrl = extractAttributionFromUrl();
-      if (fromUrl) {
+      const stored = getStoredAttribution();
+      if (fromUrl && (fromUrl.trk || !stored)) {
         storeAttribution(fromUrl.referralCode, fromUrl.clickId, fromUrl.trk);
         log("Attribution stored from URL:", fromUrl);
-      } else {
+      } else if (stored) {
         // 4. Fall back to cookie
-        const stored = getStoredAttribution();
-        if (stored) {
-          window.arkvon_referral = stored.referralCode;
-          window.arkvon_data = stored;
-          log("Attribution loaded from cookie:", stored.referralCode);
-        }
+        window.arkvon_referral = stored.referralCode;
+        window.arkvon_data = stored;
+        log("Attribution loaded from cookie:", stored.referralCode);
       }
 
       // 5. Drain any commands queued before script loaded
