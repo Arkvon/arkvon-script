@@ -194,26 +194,46 @@ When a visitor clicks an affiliate link, the backend generates a signed `trk` to
 
 **Why it matters:** Cookies are domain-scoped. If the visitor lands on `merchant.com` but pays on `checkout.partner.com`, the `arkvon_referral` cookie is inaccessible. The `trk` token is a self-contained, tamper-proof proof of attribution that works across any domain.
 
-**For payment attribution**, merchants should pass `window.arkvon_data.trk` into Stripe metadata as `arkvon_trk`:
+**For payment attribution**, send `window.arkvon_referral` and `window.arkvon_data?.trk` to your server with the checkout request:
 
 ```javascript
-const stripe = await loadStripe('...');
-const { error } = await stripe.redirectToCheckout({
-  // ...
-  metadata: {
-    affiliateCode: window.arkvon_referral,
-    arkvon_trk: window.arkvon_data?.trk,
-  },
+await fetch('/api/checkout', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    priceId,
+    referral: window.arkvon_referral || null,
+    trk: window.arkvon_data?.trk || null,
+  }),
 });
 ```
 
-The backend webhook resolver will verify the `trk` token and attribute the sale to the correct affiliate, even without cookies.
+On the server, put them in the metadata of what you create in Stripe, as `affiliateCode` and `arkvon_trk`:
+
+```javascript
+// Only set keys that have a value.
+const metadata = {};
+if (referral) metadata.affiliateCode = referral;
+if (trk) metadata.arkvon_trk = trk;
+
+// Stripe Checkout, one-off or subscription.
+await stripe.checkout.sessions.create({ mode: 'subscription', line_items, metadata /* , ... */ });
+
+// A subscription created directly (Payment Element, Elements, your own billing page).
+// Set it when you create the subscription: Stripe copies it onto the first invoice then.
+await stripe.subscriptions.create({ customer, items, metadata /* , ... */ });
+
+// A one-off PaymentIntent.
+await stripe.paymentIntents.create({ amount, currency, metadata /* , ... */ });
+```
+
+Renewals are credited to whoever was credited for the subscription's first payment, so invoices and renewals need no metadata. The backend checks the `trk` token and credits the right affiliate, even without cookies.
 
 **How the sale's affiliate is decided:**
 - **`arkvon_trk` is valid:** its affiliate is credited, even if `affiliateCode` says otherwise. The plain code comes from a cookie or URL anyone can edit; the token is signed by Arkvon.
 - **`arkvon_trk` isn't signed by Arkvon:** nobody is credited, since it was forged or edited.
 - **`arkvon_trk` has expired:** `affiliateCode` is credited only if it names the same affiliate.
-- **No `arkvon_trk`:** `affiliateCode` is used, then `client_reference_id`, then a custom field `affiliate_code`.
+- **No `arkvon_trk`:** `affiliateCode` is used. For Checkout, then `client_reference_id`, then a custom field `affiliate_code`.
 
 **What the script stores:** once a referral is stored, only a confirmed affiliate link click replaces it. That means a `trk` the backend (`GET /track/verify-trk`) confirms Arkvon signed, for that affiliate and this campaign. A bare `?ref=` (or a made-up `&trk=`) only counts when nothing is stored yet.
 
