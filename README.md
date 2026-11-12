@@ -38,9 +38,9 @@ The `click_id` and `trk` (signed cross-domain tracking token) parameters are als
 | `arkvon_referral` | Affiliate referral code | 30 days | Plain string |
 | `arkvon_data` | `{ clickId, trk, landingPage, referrerUrl, createdAt }` | 30 days | JSON |
 
-Cookie options: `path=/`, `samesite=lax`, `secure` on HTTPS, `domain=.rootdomain.com` (cross-subdomain).
+Cookie options: `path=/`, `samesite=lax`, `secure` on HTTPS, and `domain` set to the widest domain the browser accepts, so the referral is shared across subdomains (`www.merchant.com` and `app.merchant.com`).
 
-> **Multi-part TLD support.** The script ships with a hardcoded list of common multi-part public suffixes (`.co.uk`, `.com.au`, `.co.nz`, `.com.br`, etc.) and resolves the registrable domain correctly for those. On hosts the list doesn't recognize, it falls back to "last 2 labels", which is safe for the vast majority of TLDs (`.com`, `.io`, `.app`, …). Localhost, `*.local`, and IP literals get host-only cookies (no `Domain` attribute). If your TLD isn't covered and cross-subdomain tracking breaks, ask us to add it — we don't bundle the full Public Suffix List to keep the snippet small.
+> **How the domain is chosen.** On each page load the script writes a short-lived test cookie on `merchant.com`, then on each longer domain down to the full host, and uses the first one the browser keeps. Browsers refuse public suffixes (`.com`, `.co.uk`, `.com.ng`) and shared hosts (`.vercel.app`, `.myshopify.com`, `.github.io`), so on `shop.vercel.app` the cookies stay on `shop.vercel.app` and other sites on `vercel.app` can't read them. Localhost, `*.local` and IP addresses get host-only cookies (no `Domain` attribute).
 
 ## API Endpoint
 

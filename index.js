@@ -15,34 +15,6 @@
   const API_BASE = "https://api.arkvon.com"; // no trailing slash
   const COOKIE_DURATION_DAYS = 30;
 
-  // ---------------------------------------------------------------------------
-  // Cookie-domain hardcoded multi-part public suffix list
-  // ---------------------------------------------------------------------------
-  // Browsers reject `Domain=co.uk` and similar because public suffixes can't
-  // own cookies — but our previous "always slice last 2 parts" logic produced
-  // exactly that. Result: silent attribution failure for every merchant on
-  // .co.uk, .com.au, .co.nz, etc. (cookies were never set, but the script
-  // logged success). We don't want to bundle the full Public Suffix List
-  // (40k+ entries, ~4MB JSON) for an MVP script — instead we cover the
-  // commercial registrable suffixes our target market actually uses. Hosts
-  // not in this list fall back to the standard "last 2 parts" assumption,
-  // which is correct for ~95% of real merchants (.com, .net, .org, .io, .app,
-  // .dev, .co, .ai, plus all the new gTLDs).
-  //
-  // If a merchant on an unlisted multi-part TLD reports broken
-  // cross-subdomain attribution, add their suffix here. Updating the list
-  // is cheaper than maintaining a PSL build pipeline.
-  const KNOWN_MULTI_PART_TLDS = [
-    ".co.uk", ".org.uk", ".ac.uk", ".gov.uk", ".me.uk", ".net.uk", ".ltd.uk", ".plc.uk",
-    ".com.au", ".net.au", ".org.au", ".edu.au", ".gov.au", ".id.au",
-    ".co.nz", ".net.nz", ".org.nz",
-    ".com.br", ".net.br", ".org.br",
-    ".co.jp", ".or.jp", ".ne.jp",
-    ".com.cn", ".com.hk", ".com.tw", ".com.sg", ".com.tr",
-    ".com.mx", ".com.ar",
-    ".co.in", ".co.za", ".co.kr", ".co.il", ".co.id", ".co.th",
-  ];
-
   let campaignSlug = null; // value of data-arkvon attribute
   let cookieDomain = null;
   let queuedCommands = [];
@@ -68,41 +40,42 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Cookie domain resolver — public-suffix aware fallback
+  // Cookie domain
   // ---------------------------------------------------------------------------
-  // Returns either:
-  //   - a leading-dot domain string (".merchant.com" or ".merchant.co.uk")
-  //     for cross-subdomain cookie scoping, OR
-  //   - null, meaning "set the cookie with NO Domain attribute" so it's
-  //     scoped to the exact host. We pick null for: localhost, *.local,
-  //     IP literals, single-label hosts, hosts that look like bare public
-  //     suffixes, and anything we can't confidently slice. Better to lose
-  //     cross-subdomain support than silently fail to set the cookie at all.
-  function computeCookieDomain(rawHost) {
+  // Cookies go on the widest domain the browser accepts, so a referral stored
+  // on www.merchant.com is also read on app.merchant.com. Browsers refuse a
+  // cookie for a public suffix: .com, .co.uk, .com.ng, or a shared host such
+  // as .vercel.app, .myshopify.com or .github.io, where every site belongs to
+  // someone else. So each candidate is tried from the widest
+  // ("merchant.com") down to the full host, and the first whose test cookie
+  // reads back is used. Guessing from a list of suffixes instead set cookies
+  // the browser silently dropped on every suffix the list missed.
+  //
+  // Returns a leading-dot domain, or null for host-only cookies (no Domain):
+  // localhost, IP addresses, single-label hosts, and a browser that refuses
+  // every candidate.
+  function detectCookieDomain(rawHost) {
     if (!rawHost) return null;
     const host = rawHost.toLowerCase();
 
     if (host === "localhost" || host.endsWith(".local")) return null;
-
-    // IPv4 literal (e.g. 127.0.0.1) — cookies can't take a Domain attr on
-    // raw IPs; let the browser scope to the exact host.
+    // IP addresses (127.0.0.1, [::1]) can't share cookies with other hosts.
     if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return null;
-    // IPv6 literal — `[::1]` style or bare colons, never set Domain.
     if (host.includes(":") || host.startsWith("[")) return null;
 
     const parts = host.split(".");
-    if (parts.length < 2) return null; // single-label, treat as host-only
+    if (parts.length < 2) return null;
 
-    // Multi-part public suffix (e.g. .co.uk) — registrable domain is last 3.
-    for (let i = 0; i < KNOWN_MULTI_PART_TLDS.length; i++) {
-      if (host.endsWith(KNOWN_MULTI_PART_TLDS[i])) {
-        if (parts.length < 3) return null; // bare ".co.uk" host — give up
-        return "." + parts.slice(-3).join(".");
-      }
+    const probeName = "arkvon_cookie_probe";
+    const probeValue = Math.random().toString(36).slice(2) || "1";
+    for (let i = 2; i <= parts.length; i++) {
+      const candidate = "." + parts.slice(-i).join(".");
+      writeCookie(probeName, probeValue, Date.now() + 60e3, candidate);
+      const accepted = hasCookie(probeName, probeValue);
+      writeCookie(probeName, "", 0, candidate);
+      if (accepted) return candidate;
     }
-
-    // Single-part TLD (.com, .io, .app, etc.) — registrable domain is last 2.
-    return "." + parts.slice(-2).join(".");
+    return null;
   }
 
   // ---------------------------------------------------------------------------
@@ -133,15 +106,28 @@
   // Cookie helpers
   // ---------------------------------------------------------------------------
 
+  // `value` is already encoded. `domain` null means host-only.
+  function writeCookie(name, value, expiresAt, domain) {
+    let str = `${name}=${value};expires=${new Date(expiresAt).toUTCString()};path=/;samesite=lax`;
+    if (domain) str += `;domain=${domain}`;
+    if (window.location.protocol === "https:") str += ";secure";
+    document.cookie = str;
+  }
+
+  function hasCookie(name, value) {
+    return ("; " + document.cookie + ";").indexOf(`; ${name}=${value};`) !== -1;
+  }
+
   function setCookie(name, value, days) {
     try {
-      const expires = new Date(Date.now() + days * 864e5).toUTCString();
       const serialised =
         typeof value === "string" ? value : JSON.stringify(value);
-      let str = `${name}=${encodeURIComponent(serialised)};expires=${expires};path=/;samesite=lax`;
-      if (cookieDomain) str += `;domain=${cookieDomain}`;
-      if (window.location.protocol === "https:") str += ";secure";
-      document.cookie = str;
+      writeCookie(
+        name,
+        encodeURIComponent(serialised),
+        Date.now() + days * 864e5,
+        cookieDomain
+      );
     } catch (e) {
       warn("setCookie failed:", e);
     }
@@ -163,9 +149,15 @@
     }
   }
 
+  // Removes the cookie both on the shared domain and host-only, so nothing of
+  // it is left to read back.
   function deleteCookie(name) {
-    const domainStr = cookieDomain ? `;domain=${cookieDomain}` : "";
-    document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/${domainStr}`;
+    try {
+      if (cookieDomain) writeCookie(name, "", 0, cookieDomain);
+      writeCookie(name, "", 0, null);
+    } catch (e) {
+      warn("deleteCookie failed:", e);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -400,13 +392,14 @@
 
       log(`Initialising for campaign: ${campaignSlug}`);
 
-      // 2. Determine root domain for cross-subdomain cookies (public-suffix
-      //    aware — see computeCookieDomain comment for rationale).
+      // 2. Find the widest domain the browser lets us share cookies on
+      //    (see detectCookieDomain).
       try {
-        cookieDomain = computeCookieDomain(window.location.hostname);
+        cookieDomain = detectCookieDomain(window.location.hostname);
       } catch {
         cookieDomain = null;
       }
+      log("Cookie domain:", cookieDomain || "(this host only)");
 
       // 3. Check URL for fresh attribution params.
       //    With nothing stored yet, the URL's referral is used as is.
