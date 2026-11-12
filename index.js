@@ -249,6 +249,26 @@
     return null;
   }
 
+  // Asks the backend whether `trk` is a token Arkvon signed. Only the backend
+  // holds the key, and a `trk` in the URL can be made up by anyone. Returns
+  // { referralCode, campaignSlug, clickId } when it's real, else null
+  // (including when the check itself fails).
+  async function verifyTrk(trk) {
+    try {
+      const res = await fetch(
+        `${API_BASE}/track/verify-trk?trk=${encodeURIComponent(trk)}`,
+        { method: "GET", credentials: "omit", signal: timeoutSignal(4000) }
+      );
+      if (!res.ok) return null;
+      const body = await res.json();
+      const result = body && body.data ? body.data : body;
+      return result && result.valid === true ? result : null;
+    } catch (e) {
+      log("trk verification failed:", e && e.message);
+      return null;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Signup / lead tracking
   // ---------------------------------------------------------------------------
@@ -388,15 +408,39 @@
         cookieDomain = null;
       }
 
-      // 3. Check URL for fresh attribution params (highest priority)
-      //    A link carrying Arkvon's signed token (trk) comes from an affiliate
-      //    link click, so it replaces what's stored. A bare ?ref= is often a
-      //    marketing tag (?ref=producthunt), so it only counts when nothing
-      //    is stored yet; replacing a real referral with it lost the sale.
+      // 3. Check URL for fresh attribution params.
+      //    With nothing stored yet, the URL's referral is used as is.
+      //    Replacing a stored referral takes an affiliate link click: a
+      //    `trk` the backend confirms Arkvon signed, for this affiliate and
+      //    this campaign. A bare ?ref= is often a marketing tag
+      //    (?ref=producthunt), and anyone can type `&trk=anything`, so
+      //    neither can take a sale away from the affiliate stored first.
       const fromUrl = extractAttributionFromUrl();
       const stored = getStoredAttribution();
-      if (fromUrl && (fromUrl.trk || !stored)) {
+      let fromUrlStored = false;
+
+      if (fromUrl && !stored) {
         storeAttribution(fromUrl.referralCode, fromUrl.clickId, fromUrl.trk);
+        fromUrlStored = true;
+      } else if (fromUrl && fromUrl.trk && fromUrl.trk !== stored.trk) {
+        const verified = await verifyTrk(fromUrl.trk);
+        if (
+          verified &&
+          verified.referralCode === fromUrl.referralCode &&
+          verified.campaignSlug === campaignSlug
+        ) {
+          storeAttribution(
+            fromUrl.referralCode,
+            verified.clickId || fromUrl.clickId,
+            fromUrl.trk
+          );
+          fromUrlStored = true;
+        } else {
+          log("Link's trk not confirmed; keeping stored referral:", stored.referralCode);
+        }
+      }
+
+      if (fromUrlStored) {
         log("Attribution stored from URL:", fromUrl);
       } else if (stored) {
         // 4. Fall back to cookie

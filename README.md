@@ -19,7 +19,7 @@ Enable debug logging during development (add **before** the script tag):
 1. Script loads, reads campaign slug from `data-arkvon` attribute.
 2. Determines root cookie domain for cross-subdomain support.
 3. Checks URL for `?ref=AFFILIATE_CODE&click_id=CLICK_SLUG&trk=TOKEN` (set by the click redirect).
-4. Stores attribution (`arkvon_referral` + `arkvon_data` cookies, 30 days). `arkvon_data` includes `clickId`, `trk` (cross-domain token), `landingPage`, `referrerUrl`.
+4. Stores attribution (`arkvon_referral` + `arkvon_data` cookies, 30 days). A stored referral is only replaced by an affiliate link click whose `trk` the backend confirms (see Cross-Domain Tracking). `arkvon_data` includes `clickId`, `trk` (cross-domain token), `landingPage`, `referrerUrl`.
 5. On subsequent page loads, loads attribution from cookies if URL params are absent.
 6. Sets up auto form tracking for forms opted in via `data-arkvon-track-form`, `[data-arkvon-submit]`, or the legacy `#submit-btn` ID.
 7. Drains any queued commands, replaces stub with live function.
@@ -208,6 +208,14 @@ const { error } = await stripe.redirectToCheckout({
 ```
 
 The backend webhook resolver will verify the `trk` token and attribute the sale to the correct affiliate, even without cookies.
+
+**How the sale's affiliate is decided:**
+- **`arkvon_trk` is valid:** its affiliate is credited, even if `affiliateCode` says otherwise. The plain code comes from a cookie or URL anyone can edit; the token is signed by Arkvon.
+- **`arkvon_trk` isn't signed by Arkvon:** nobody is credited, since it was forged or edited.
+- **`arkvon_trk` has expired:** `affiliateCode` is credited only if it names the same affiliate.
+- **No `arkvon_trk`:** `affiliateCode` is used, then `client_reference_id`, then a custom field `affiliate_code`.
+
+**What the script stores:** once a referral is stored, only a confirmed affiliate link click replaces it. That means a `trk` the backend (`GET /track/verify-trk`) confirms Arkvon signed, for that affiliate and this campaign. A bare `?ref=` (or a made-up `&trk=`) only counts when nothing is stored yet.
 
 ## Security
 
