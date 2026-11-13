@@ -8,6 +8,14 @@ Lightweight JavaScript snippet merchants embed on their websites to capture affi
 <script data-arkvon="YOUR_CAMPAIGN_SLUG" src="https://cdn.jsdelivr.net/gh/Arkvon/arkvon-script@latest/index.js" async></script>
 ```
 
+If your own code calls `arkvon('signup', …)` (React and other single-page apps, see below), also add this line **before** the script tag:
+
+```html
+<script>window.arkvon=window.arkvon||function(c,d){(window.arkvon.queue=window.arkvon.queue||[]).push({command:c,data:d})};</script>
+```
+
+The script loads `async`, so your code can run before it arrives. Until then `arkvon` doesn't exist: a call to it throws a `ReferenceError` in your handler, and a call behind a `typeof` check is skipped, so the signup is lost. The line makes `arkvon` a function from the start that queues each call, and the script sends the queue once it has started (see Command Queue).
+
 Enable debug logging during development (add **before** the script tag):
 
 ```html
@@ -22,7 +30,7 @@ Enable debug logging during development (add **before** the script tag):
 4. Stores attribution (`arkvon_referral` + `arkvon_data` cookies, 30 days). A stored referral is only replaced by an affiliate link click whose `trk` the backend confirms (see Cross-Domain Tracking). `arkvon_data` includes `clickId`, `trk` (cross-domain token), `landingPage`, `referrerUrl`.
 5. On subsequent page loads, loads attribution from cookies if URL params are absent.
 6. Sets up auto form tracking for forms opted in via `data-arkvon-track-form`, `[data-arkvon-submit]`, or the legacy `#submit-btn` ID.
-7. Drains any queued commands, replaces stub with live function.
+7. Sends any signups queued before it was ready (by the pre-load line, or while it was starting up), then replaces the queueing function with the live one.
 8. Dispatches `arkvonReady` and `arkvonScriptLoaded` events.
 
 ## Referral Parameters Detected
@@ -69,19 +77,19 @@ The tradeoff: the response is opaque (script can't read the server's reply). Thi
 ## Tracking Events
 
 ```javascript
-// Wait for script to be ready
-document.addEventListener('arkvonScriptLoaded', function() {
-  // Track signup (only active command currently)
-  arkvon('signup', {
-    email: 'user@example.com',
-    firstName: 'John',
-    lastName: 'Doe'
-  });
-
-  // Shorthand
-  arkvon.signup('user@example.com', { firstName: 'John' });
+// Track signup (only active command currently). With the pre-load line from
+// Setup this works at any time: before the script is ready it's queued.
+arkvon('signup', {
+  email: 'user@example.com',
+  firstName: 'John',
+  lastName: 'Doe'
 });
+
+// Shorthand: only exists once the script is ready (after `arkvonReady`).
+arkvon.signup('user@example.com', { firstName: 'John' });
 ```
+
+Don't wait for `arkvonReady` or `arkvonScriptLoaded` when someone signs up: each fires once, when the script starts, so a listener added after that never runs and the signup is lost. Use the pre-load line instead.
 
 ### Compatibility commands (no-op, won't break existing integrations)
 
@@ -126,6 +134,8 @@ A form is automatically tracked on submit if it matches **any** of the following
 
 Email is found by checking `name` attributes: `email`, `user_email`, `customer_email`, `signup_email`, or fallback `input[type="email"]`.
 
+The script starts listening for submits when it has loaded, so a tracked form submitted before then isn't seen; the pre-load line doesn't change that. It only matters for a form submitted in the first moments after the page opens.
+
 ### React / SPA forms — call `arkvon('signup', …)` explicitly
 
 The auto-tracker listens for native browser `submit` events. Most React form libraries (React Hook Form, Formik, plain `onSubmit` handlers that call `e.preventDefault()`) **suppress that event** as soon as validation passes — the auto-tracker never sees it.
@@ -138,6 +148,8 @@ const onSubmit = async (values) => {
   if (!res.ok) return;
 
   // Fire-and-forget — the script handles cookies, retries, no-cors transport.
+  // With the pre-load line (Setup), window.arkvon is a function from the start,
+  // so a signup before the script has loaded is queued, not skipped.
   if (typeof window !== "undefined" && typeof window.arkvon === "function") {
     window.arkvon("signup", {
       email: values.email,
@@ -148,7 +160,7 @@ const onSubmit = async (values) => {
 };
 ```
 
-Calling `arkvon('signup', …)` is safe even before the script has finished loading — early calls are queued and drained on init.
+With the pre-load line from Setup, calling `arkvon('signup', …)` before the script has loaded is safe: the call is queued and sent once the script starts. Without it, the check above skips the call and the signup is lost.
 
 ## Utility Helpers
 
@@ -162,8 +174,8 @@ arkvonUtils.clearTracking()     // deletes cookies + window globals
 
 | Variable | Type | Description |
 |----------|------|-------------|
-| `window.arkvon` | Function | Main command function |
-| `window.arkvon.signup` | Function | Signup shorthand |
+| `window.arkvon` | Function | Main command function. Until the script is ready, a function that queues `arkvon('signup', …)` calls (the pre-load line's, or the script's own while it starts) |
+| `window.arkvon.signup` | Function | Signup shorthand, once the script is ready |
 | `window.arkvon.track` | Function | Custom event (no-op) |
 | `window.arkvon.conversion` | Function | Conversion (no-op) |
 | `window.arkvon_referral` | String/null | Current referral code |
@@ -179,13 +191,20 @@ arkvonUtils.clearTracking()     // deletes cookies + window globals
 
 ## Command Queue
 
-Commands called before the script finishes loading are queued and drained automatically:
+`arkvon('signup', …)` calls made before the script is ready are queued and sent, in order, once it has started:
+
+- **Before the script file has loaded:** queued only with the pre-load line from Setup. Without it, `arkvon` doesn't exist yet: a direct call throws a `ReferenceError`, and a call behind a `typeof` check is skipped. Either way the signup is lost.
+- **While the script is starting up** (for example while it checks a new link's `trk` with the backend): queued by the script itself.
+- **After `arkvonReady`:** sent straight away.
+
+Only the `arkvon('signup', …)` form is queued: `arkvon.signup(…)`, `arkvon.track(…)` and `arkvon.conversion(…)` exist only once the script is ready.
 
 ```javascript
-// Before script loads — queued
+// Pre-load line in place, script not loaded yet: queued, sent once it starts.
 arkvon('signup', { email: 'early@example.com' });
 
-// After script loads — processed immediately
+// After the script is ready: sent straight away.
+arkvon('signup', { email: 'later@example.com' });
 ```
 
 ## Cross-Domain Tracking
