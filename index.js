@@ -191,6 +191,28 @@
     window.arkvon_data = { referralCode, ...dataObj };
   }
 
+  // Safari (every browser on iPhone) keeps a cookie written by a page's
+  // script for 7 days from when it was last written, whatever its expiry.
+  // Writing the stored referral again on each visit keeps it for visitors
+  // who come back within a week, but never past 30 days from the click
+  // (createdAt). Test referrals end with their test, so they're left alone.
+  // Arkvon also credits a payment from the visitor's tracked signup, which
+  // covers one-time visitors who pay later.
+  function refreshStoredAttribution(stored) {
+    try {
+      if (!stored || typeof stored.createdAt !== "number") return;
+      if (String(stored.referralCode).indexOf("arkvon_test_") === 0) return;
+      const end = stored.createdAt + COOKIE_DURATION_DAYS * 864e5;
+      const daysLeft = (end - Date.now()) / 864e5;
+      if (daysLeft <= 0) return;
+      const { referralCode, ...data } = stored;
+      setCookie("arkvon_referral", referralCode, daysLeft);
+      setCookie("arkvon_data", data, daysLeft);
+    } catch (e) {
+      log("Couldn't refresh the stored referral:", e && e.message);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // URL param extraction
   // ---------------------------------------------------------------------------
@@ -250,7 +272,8 @@
   async function verifyTrk(trk) {
     try {
       const res = await fetch(
-        `${API_BASE}/track/verify-trk?trk=${encodeURIComponent(trk)}`,
+        `${API_BASE}/track/verify-trk?trk=${encodeURIComponent(trk)}` +
+          `&slug=${encodeURIComponent(campaignSlug || "")}`,
         { method: "GET", credentials: "omit", signal: timeoutSignal(4000) }
       );
       if (!res.ok) return null;
@@ -580,10 +603,12 @@
         fromUrlStored = true;
       } else if (fromUrl && fromUrl.trk && fromUrl.trk !== stored.trk) {
         const verified = await verifyTrk(fromUrl.trk);
+        // Any of the merchant's campaigns: one tag serves them all.
         if (
           verified &&
           verified.referralCode === fromUrl.referralCode &&
-          verified.campaignSlug === campaignSlug
+          (verified.campaignSlug === campaignSlug ||
+            verified.sameMerchant === true)
         ) {
           storeAttribution(
             fromUrl.referralCode,
@@ -603,6 +628,7 @@
         window.arkvon_referral = stored.referralCode;
         window.arkvon_data = stored;
         log("Attribution loaded from cookie:", stored.referralCode);
+        refreshStoredAttribution(stored);
       }
 
       // 6. Drain any commands queued before script loaded
