@@ -1,4 +1,4 @@
-# Arkvon Tracking Script v2.0
+# Arkvon Tracking Script v2.1
 
 Lightweight JavaScript snippet merchants embed on their websites to capture affiliate attribution and lead events.
 
@@ -26,12 +26,14 @@ Enable debug logging during development (add **before** the script tag):
 
 1. Script loads, reads campaign slug from `data-arkvon` attribute.
 2. Determines root cookie domain for cross-subdomain support.
-3. Checks URL for `?ref=AFFILIATE_CODE&click_id=CLICK_SLUG&trk=TOKEN` (set by the click redirect).
-4. Stores attribution (`arkvon_referral` + `arkvon_data` cookies, 30 days). A stored referral is only replaced by an affiliate link click whose `trk` the backend confirms (see Cross-Domain Tracking). `arkvon_data` includes `clickId`, `trk` (cross-domain token), `landingPage`, `referrerUrl`.
-5. On subsequent page loads, loads attribution from cookies if URL params are absent.
-6. Sets up auto form tracking for forms opted in via `data-arkvon-track-form`, `[data-arkvon-submit]`, or the legacy `#submit-btn` ID.
-7. Sends any signups queued before it was ready (by the pre-load line, or while it was starting up), then replaces the queueing function with the live one.
-8. Dispatches `arkvonReady` and `arkvonScriptLoaded` events.
+3. If a "Test your setup" is open in this browser (`?arkvon_test=<id>`, or its cookie), reports this page to Arkvon and stores the test referral (see Test Your Setup).
+4. Checks URL for `?ref=AFFILIATE_CODE&click_id=CLICK_SLUG&trk=TOKEN` (set by the click redirect).
+5. Stores attribution (`arkvon_referral` + `arkvon_data` cookies, 30 days). A stored referral is only replaced by an affiliate link click whose `trk` the backend confirms (see Cross-Domain Tracking). `arkvon_data` includes `clickId`, `trk` (cross-domain token), `landingPage`, `referrerUrl`.
+6. On subsequent page loads, loads attribution from cookies if URL params are absent.
+7. Sets up auto form tracking for forms opted in via `data-arkvon-track-form`, `[data-arkvon-submit]`, or the legacy `#submit-btn` ID.
+8. Sends any signups queued before it was ready (by the pre-load line, or while it was starting up), then replaces the queueing function with the live one.
+9. Adds the referral to Stripe Pricing Tables, Buy Buttons and buy.stripe.com Payment Links on the page, now and as they're added (see Stripe No-Code Checkouts).
+10. Dispatches `arkvonReady` and `arkvonScriptLoaded` events.
 
 ## Referral Parameters Detected
 
@@ -45,6 +47,11 @@ The `click_id` and `trk` (signed cross-domain tracking token) parameters are als
 |--------|---------|----------|--------|
 | `arkvon_referral` | Affiliate referral code | 30 days | Plain string |
 | `arkvon_data` | `{ clickId, trk, landingPage, referrerUrl, createdAt }` | 30 days | JSON |
+| `arkvon_test` | The open test's id, while "Test your setup" runs in this browser | Until the test ends (30 min) | Plain string |
+
+A test referral is stored in `arkvon_referral` / `arkvon_data` like a real one, but only until its test ends.
+
+> **Safari and iPhone.** Safari (every browser on iPhone) keeps a cookie written by a page's script for 7 days from when it was last written, whatever its expiry. The script writes the stored referral again on every visit, never past 30 days from the click (`createdAt`), so a visitor who comes back within a week stays credited for the whole window. A one-time visitor who pays more than 7 days later reaches checkout with no referral; Arkvon then credits the payment from their tracked signup with the same email, so tracking signups matters (see Tracking Events).
 
 Cookie options: `path=/`, `samesite=lax`, `secure` on HTTPS, and `domain` set to the widest domain the browser accepts, so the referral is shared across subdomains (`www.merchant.com` and `app.merchant.com`).
 
@@ -55,6 +62,8 @@ Cookie options: `path=/`, `samesite=lax`, `secure` on HTTPS, and `domain` set to
 | Endpoint | Trigger | Transport |
 |----------|---------|-----------|
 | `POST /track/signup` | `arkvon('signup', { email })` or auto form submit | `fetch` with `mode: "no-cors"`, `URLSearchParams` body |
+| `GET /track/verify-trk` | A new affiliate link while a referral is stored | `fetch` GET, CORS `*` |
+| `GET /track/test` | Every page load while a test is open | `fetch` GET, CORS `*` |
 
 ### Signup Payload
 
@@ -162,12 +171,34 @@ const onSubmit = async (values) => {
 
 With the pre-load line from Setup, calling `arkvon('signup', …)` before the script has loaded is safe: the call is queued and sent once the script starts. Without it, the check above skips the call and the signup is lost.
 
+## Stripe No-Code Checkouts
+
+Stripe Pricing Tables, Buy Buttons and Payment Links can't carry metadata. Stripe copies their `client-reference-id` (a Payment Link's `client_reference_id` parameter) onto the Checkout Session, where Arkvon reads it. When a referral is stored, the script adds it for the merchant:
+
+- `<stripe-pricing-table>` and `<stripe-buy-button>`: sets `client-reference-id`. An element Stripe has already rendered is replaced by a copy carrying the attribute, so it renders again with it.
+- Links to `buy.stripe.com`: adds `client_reference_id` to the URL, on load, for links added later (a `MutationObserver`), and on click.
+- Never replaces a value the merchant set (it can be their own user id).
+- Skips codes Stripe would silently drop (anything but letters, digits, `-` and `_`).
+
+Payment Links on a merchant's own domain aren't recognised: add `client_reference_id` to those yourself.
+
+## Test Your Setup
+
+"Test your setup" on Arkvon → Integrations opens the merchant's site with `?arkvon_test=<id>` (a one-time id, valid 30 minutes). While it runs in that browser:
+
+1. The script keeps the id in the `arkvon_test` cookie (reading it back is the cookie check), and on every page calls `GET /track/test?id&slug&page&cookie`: its `data-arkvon` value, the page's origin and path (no query), and whether the cookie saved.
+2. For an open test with this campaign's slug, Arkvon answers with a test referral (`arkvon_test_…` and a `trk` signed for it that expires with the test). The script stores it in place of any stored referral, until the test ends, so the merchant's own checkout and signup code send it like a real one.
+3. A wrong slug gets no referral; the script warns in the console with the expected ID.
+4. Arkvon then looks for the test referral on the merchant's Stripe account and in signups.
+
+Test referrals never earn: Arkvon ignores them for clicks, leads and sales. Only an open test's unguessable id hands one out, and `verify-trk` refuses test tokens, so a link can't use one to replace a real affiliate's referral.
+
 ## Utility Helpers
 
 ```javascript
 arkvonUtils.isReferralUser()    // boolean
 arkvonUtils.getReferralData()   // { referralCode, clickId, landingPage, ... } | null
-arkvonUtils.clearTracking()     // deletes cookies + window globals
+arkvonUtils.clearTracking()     // deletes cookies (referral, data, test) + window globals
 ```
 
 ## Global Variables
@@ -254,7 +285,7 @@ Renewals are credited to whoever was credited for the subscription's first payme
 - **`arkvon_trk` has expired:** `affiliateCode` is credited only if it names the same affiliate.
 - **No `arkvon_trk`:** `affiliateCode` is used. For Checkout, then `client_reference_id`, then a custom field `affiliate_code`.
 
-**What the script stores:** once a referral is stored, only a confirmed affiliate link click replaces it. That means a `trk` the backend (`GET /track/verify-trk`) confirms Arkvon signed, for that affiliate and this campaign. A bare `?ref=` (or a made-up `&trk=`) only counts when nothing is stored yet.
+**What the script stores:** once a referral is stored, only a confirmed affiliate link click replaces it. That means a `trk` the backend (`GET /track/verify-trk?trk=&slug=`) confirms Arkvon signed, for that affiliate and this campaign or another campaign of the same merchant (`sameMerchant`): one tag serves all of a merchant's campaigns. A bare `?ref=` (or a made-up `&trk=`) only counts when nothing is stored yet.
 
 ## Security
 

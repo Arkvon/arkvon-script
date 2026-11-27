@@ -1,5 +1,5 @@
 /**
- * Arkvon Tracking Script v2.0
+ * Arkvon Tracking Script v2.1
  *
  * Install on any merchant website:
  *   <script data-arkvon="your-campaign-slug" src="https://cdn.arkvon.com/track.js" async></script>
@@ -175,8 +175,10 @@
     return { referralCode: code, ...(data && typeof data === "object" ? data : {}) };
   }
 
-  function storeAttribution(referralCode, clickId, trk) {
-    setCookie("arkvon_referral", referralCode, COOKIE_DURATION_DAYS);
+  // `days` defaults to the 30-day referral window; a test referral passes
+  // the time left on its test instead.
+  function storeAttribution(referralCode, clickId, trk, days = COOKIE_DURATION_DAYS) {
+    setCookie("arkvon_referral", referralCode, days);
     const dataObj = {
       clickId: clickId || null,
       trk: trk || null,
@@ -184,9 +186,31 @@
       referrerUrl: document.referrer || null,
       createdAt: Date.now(),
     };
-    setCookie("arkvon_data", dataObj, COOKIE_DURATION_DAYS);
+    setCookie("arkvon_data", dataObj, days);
     window.arkvon_referral = referralCode;
     window.arkvon_data = { referralCode, ...dataObj };
+  }
+
+  // Safari (every browser on iPhone) keeps a cookie written by a page's
+  // script for 7 days from when it was last written, whatever its expiry.
+  // Writing the stored referral again on each visit keeps it for visitors
+  // who come back within a week, but never past 30 days from the click
+  // (createdAt). Test referrals end with their test, so they're left alone.
+  // Arkvon also credits a payment from the visitor's tracked signup, which
+  // covers one-time visitors who pay later.
+  function refreshStoredAttribution(stored) {
+    try {
+      if (!stored || typeof stored.createdAt !== "number") return;
+      if (String(stored.referralCode).indexOf("arkvon_test_") === 0) return;
+      const end = stored.createdAt + COOKIE_DURATION_DAYS * 864e5;
+      const daysLeft = (end - Date.now()) / 864e5;
+      if (daysLeft <= 0) return;
+      const { referralCode, ...data } = stored;
+      setCookie("arkvon_referral", referralCode, daysLeft);
+      setCookie("arkvon_data", data, daysLeft);
+    } catch (e) {
+      log("Couldn't refresh the stored referral:", e && e.message);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -248,7 +272,8 @@
   async function verifyTrk(trk) {
     try {
       const res = await fetch(
-        `${API_BASE}/track/verify-trk?trk=${encodeURIComponent(trk)}`,
+        `${API_BASE}/track/verify-trk?trk=${encodeURIComponent(trk)}` +
+          `&slug=${encodeURIComponent(campaignSlug || "")}`,
         { method: "GET", credentials: "omit", signal: timeoutSignal(4000) }
       );
       if (!res.ok) return null;
@@ -259,6 +284,162 @@
       log("trk verification failed:", e && e.message);
       return null;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test your setup (Arkvon dashboard → Integrations)
+  // ---------------------------------------------------------------------------
+  // "Start test" opens the merchant's site with ?arkvon_test=<id>. While the
+  // test is open in this browser (its id kept in a cookie), every page the
+  // script runs on reports in, so the dashboard can show where it's
+  // installed and whether its cookie saves. For an open test with this
+  // campaign's slug, Arkvon answers with a test referral, stored like a real
+  // one, so the merchant's own checkout passes it to Stripe and the
+  // dashboard can find it there. Test referrals never earn: Arkvon ignores
+  // them for sales and leads. Only an open test's unguessable id gets one.
+
+  const TEST_ID_PATTERN = /^[0-9a-f-]{36}$/i;
+
+  function readTestId() {
+    try {
+      const fromUrl = new URLSearchParams(window.location.search).get("arkvon_test");
+      if (fromUrl && TEST_ID_PATTERN.test(fromUrl)) return fromUrl;
+    } catch {
+      // ignore
+    }
+    const fromCookie = getCookie("arkvon_test");
+    return typeof fromCookie === "string" && TEST_ID_PATTERN.test(fromCookie)
+      ? fromCookie
+      : null;
+  }
+
+  // Reports this page and stores the test referral. Returns true when the
+  // test referral is now the stored one.
+  async function runTest(testId) {
+    // Keeping the id in a cookie is also the cookie check itself.
+    setCookie("arkvon_test", testId, 30 / (24 * 60));
+    const cookieSaved = getCookie("arkvon_test") === testId;
+    const query = new URLSearchParams({
+      id: testId,
+      slug: campaignSlug,
+      page: window.location.origin + window.location.pathname,
+      cookie: cookieSaved ? "1" : "0",
+    });
+    let answer = null;
+    try {
+      const res = await fetch(`${API_BASE}/track/test?${query}`, {
+        method: "GET",
+        credentials: "omit",
+        signal: timeoutSignal(5000),
+      });
+      if (res.ok) {
+        const body = await res.json();
+        answer = body && body.data !== undefined ? body.data : body;
+      }
+    } catch (e) {
+      log("Test report failed:", e && e.message);
+      return false;
+    }
+
+    if (!answer || answer.active !== true) {
+      deleteCookie("arkvon_test");
+      log("No open Arkvon test for this id.");
+      return false;
+    }
+    if (answer.campaignMatches !== true) {
+      warn(
+        `Test: this page's data-arkvon is "${campaignSlug}", but the test is for "${answer.expectedSlug}". Copy the script tag again from Arkvon → Integrations.`
+      );
+      return false;
+    }
+
+    const msLeft = Math.max(60e3, Date.parse(answer.expiresAt) - Date.now());
+    const days = msLeft / 864e5;
+    setCookie("arkvon_test", testId, days);
+    storeAttribution(answer.referralCode, null, answer.trk, days);
+    log("Test referral stored:", answer.referralCode);
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stripe no-code checkouts: Pricing Tables, Buy Buttons, Payment Links
+  // ---------------------------------------------------------------------------
+  // These can't carry metadata; Stripe passes `client-reference-id` (or a
+  // Payment Link's `client_reference_id` parameter) to the Checkout Session,
+  // where Arkvon reads it. The script adds the stored referral itself, so a
+  // site built with these needs no code. It never replaces a value the
+  // merchant set (it can be their own user id). Stripe silently drops a value
+  // that isn't letters, digits, - or _, so such codes are left out.
+
+  const STRIPE_EMBEDS = ["stripe-pricing-table", "stripe-buy-button"];
+
+  function stripeSafe(code) {
+    return typeof code === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(code);
+  }
+
+  function tagPaymentLink(a, code) {
+    try {
+      const url = new URL(a.href, window.location.href);
+      if (url.hostname !== "buy.stripe.com") return;
+      if (url.searchParams.has("client_reference_id")) return;
+      url.searchParams.set("client_reference_id", code);
+      a.href = url.toString();
+    } catch {
+      // not a URL we can rewrite
+    }
+  }
+
+  function tagStripeCheckouts() {
+    const code = window.arkvon_referral;
+    if (!stripeSafe(code)) return;
+
+    STRIPE_EMBEDS.forEach((tag) => {
+      document.querySelectorAll(tag + ":not([client-reference-id])").forEach((el) => {
+        if (window.customElements && window.customElements.get(tag)) {
+          // Already rendered with the attributes it had: render it again.
+          const fresh = el.cloneNode(false);
+          fresh.setAttribute("client-reference-id", code);
+          el.replaceWith(fresh);
+        } else {
+          // Not upgraded yet: Stripe's script reads the attribute when it is.
+          el.setAttribute("client-reference-id", code);
+        }
+        log("Added the referral to <" + tag + ">");
+      });
+    });
+    document
+      .querySelectorAll('a[href*="buy.stripe.com"]')
+      .forEach((a) => tagPaymentLink(a, code));
+  }
+
+  function setupStripeCheckouts() {
+    if (!stripeSafe(window.arkvon_referral)) return;
+    tagStripeCheckouts();
+
+    // Elements added later (single-page apps, lazy sections).
+    if (typeof MutationObserver !== "undefined") {
+      let queued = false;
+      new MutationObserver(() => {
+        if (queued) return;
+        queued = true;
+        setTimeout(() => {
+          queued = false;
+          tagStripeCheckouts();
+        }, 50);
+      }).observe(document.documentElement, { childList: true, subtree: true });
+    }
+
+    // A link whose href is set by code just before the click.
+    document.addEventListener(
+      "click",
+      (e) => {
+        const a = e.target && e.target.closest && e.target.closest("a[href]");
+        if (a && stripeSafe(window.arkvon_referral)) {
+          tagPaymentLink(a, window.arkvon_referral);
+        }
+      },
+      true
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -401,14 +582,19 @@
       }
       log("Cookie domain:", cookieDomain || "(this host only)");
 
-      // 3. Check URL for fresh attribution params.
+      // 3. Test your setup: an open test's referral replaces whatever is
+      //    stored, for the rest of the test (see runTest).
+      const testId = readTestId();
+      const testStored = testId ? await runTest(testId) : false;
+
+      // 4. Check URL for fresh attribution params.
       //    With nothing stored yet, the URL's referral is used as is.
       //    Replacing a stored referral takes an affiliate link click: a
       //    `trk` the backend confirms Arkvon signed, for this affiliate and
       //    this campaign. A bare ?ref= is often a marketing tag
       //    (?ref=producthunt), and anyone can type `&trk=anything`, so
       //    neither can take a sale away from the affiliate stored first.
-      const fromUrl = extractAttributionFromUrl();
+      const fromUrl = testStored ? null : extractAttributionFromUrl();
       const stored = getStoredAttribution();
       let fromUrlStored = false;
 
@@ -417,10 +603,12 @@
         fromUrlStored = true;
       } else if (fromUrl && fromUrl.trk && fromUrl.trk !== stored.trk) {
         const verified = await verifyTrk(fromUrl.trk);
+        // Any of the merchant's campaigns: one tag serves them all.
         if (
           verified &&
           verified.referralCode === fromUrl.referralCode &&
-          verified.campaignSlug === campaignSlug
+          (verified.campaignSlug === campaignSlug ||
+            verified.sameMerchant === true)
         ) {
           storeAttribution(
             fromUrl.referralCode,
@@ -436,13 +624,14 @@
       if (fromUrlStored) {
         log("Attribution stored from URL:", fromUrl);
       } else if (stored) {
-        // 4. Fall back to cookie
+        // 5. Fall back to cookie
         window.arkvon_referral = stored.referralCode;
         window.arkvon_data = stored;
         log("Attribution loaded from cookie:", stored.referralCode);
+        refreshStoredAttribution(stored);
       }
 
-      // 5. Drain any commands queued before script loaded
+      // 6. Drain any commands queued before script loaded
       if (window.arkvon && Array.isArray(window.arkvon.queue)) {
         for (const item of window.arkvon.queue) {
           if (item && item.command) {
@@ -451,7 +640,7 @@
         }
       }
 
-      // 6. Replace stub with live function
+      // 7. Replace stub with live function
       window.arkvon = async (command, data = {}) => processCommand(command, data);
       window.arkvon.signup = (email, opts = {}) => trackSignup(email, opts);
       window.arkvon.track = (eventName, eventData = {}) =>
@@ -459,21 +648,25 @@
       window.arkvon.conversion = (value, type = "purchase") =>
         processCommand("conversion", { value, type });
 
-      // 7. Expose utility helpers
+      // 8. Expose utility helpers
       window.arkvonUtils = {
         getReferralData: () => getStoredAttribution(),
         isReferralUser: () => !!getStoredAttribution(),
         clearTracking: () => {
           deleteCookie("arkvon_referral");
           deleteCookie("arkvon_data");
+          deleteCookie("arkvon_test");
           window.arkvon_referral = null;
           window.arkvon_data = null;
           log("Tracking cleared");
         },
       };
 
-      // 8. Auto form tracking
+      // 9. Auto form tracking
       setupFormTracking();
+
+      // 10. The referral on Stripe Pricing Tables, Buy Buttons and Payment Links
+      setupStripeCheckouts();
 
       document.dispatchEvent(new CustomEvent("arkvonReady", { detail: { campaignSlug } }));
       document.dispatchEvent(new Event("arkvonScriptLoaded"));
