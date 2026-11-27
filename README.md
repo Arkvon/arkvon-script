@@ -51,6 +51,8 @@ The `click_id` and `trk` (signed cross-domain tracking token) parameters are als
 
 A test referral is stored in `arkvon_referral` / `arkvon_data` like a real one, but only until its test ends.
 
+> **Safari and iPhone.** Safari (every browser on iPhone) keeps a cookie written by a page's script for 7 days from when it was last written, whatever its expiry. The script writes the stored referral again on every visit, never past 30 days from the click (`createdAt`), so a visitor who comes back within a week stays credited for the whole window. A one-time visitor who pays more than 7 days later reaches checkout with no referral; Arkvon then credits the payment from their tracked signup with the same email, so tracking signups matters (see Tracking Events).
+
 Cookie options: `path=/`, `samesite=lax`, `secure` on HTTPS, and `domain` set to the widest domain the browser accepts, so the referral is shared across subdomains (`www.merchant.com` and `app.merchant.com`).
 
 > **How the domain is chosen.** On each page load the script writes a short-lived test cookie on `merchant.com`, then on each longer domain down to the full host, and uses the first one the browser keeps. Browsers refuse public suffixes (`.com`, `.co.uk`, `.com.ng`) and shared hosts (`.vercel.app`, `.myshopify.com`, `.github.io`), so on `shop.vercel.app` the cookies stay on `shop.vercel.app` and other sites on `vercel.app` can't read them. Localhost, `*.local` and IP addresses get host-only cookies (no `Domain` attribute).
@@ -283,7 +285,7 @@ Renewals are credited to whoever was credited for the subscription's first payme
 - **`arkvon_trk` has expired:** `affiliateCode` is credited only if it names the same affiliate.
 - **No `arkvon_trk`:** `affiliateCode` is used. For Checkout, then `client_reference_id`, then a custom field `affiliate_code`.
 
-**What the script stores:** once a referral is stored, only a confirmed affiliate link click replaces it. That means a `trk` the backend (`GET /track/verify-trk`) confirms Arkvon signed, for that affiliate and this campaign. A bare `?ref=` (or a made-up `&trk=`) only counts when nothing is stored yet.
+**What the script stores:** once a referral is stored, only a confirmed affiliate link click replaces it. That means a `trk` the backend (`GET /track/verify-trk?trk=&slug=`) confirms Arkvon signed, for that affiliate and this campaign or another campaign of the same merchant (`sameMerchant`): one tag serves all of a merchant's campaigns. A bare `?ref=` (or a made-up `&trk=`) only counts when nothing is stored yet.
 
 ## Security
 
